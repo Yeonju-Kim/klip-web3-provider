@@ -3,11 +3,12 @@
 // This file is derived from coinbase-wallet-sdk/packages/wallet-sdk/src/provider/CoinbaseWalletProvider.ts (2022/08/01).
 // Modified for the klip-web3-provider development.
 
-const { prepare, getResult } = require('klip-sdk');
+const { prepare, getResult, request } = require('klip-sdk');
 import SafeEventEmitter from '@metamask/safe-event-emitter';
 import { convertHexToUtf8 } from '@walletconnect/utils';
 import { ethErrors } from 'eth-rpc-errors';
 import Caver from 'caver-js';
+import axios from 'axios';
 
 import QRCodeModal from './klip-qrcode-modal';
 import { JSONRPCResponse, JSONRPCRequest, JSONRPCMethod } from './JSONRPC';
@@ -16,6 +17,7 @@ import { SubscriptionManager, SubscriptionNotification, SubscriptionResult } fro
 const CypressChainId = '0x2019';
 const ErrorMsgCaverUndefined = 'RPC Url is not provided or chain id is different from Klaytn Mainnet.';
 const KlipUrl = 'https://klipwallet.com/?target=/a2a?request_key=';
+const KlipAPIUrl = 'https://a2a-api.klipwallet.com/v2/a2a/prepare';
 export type Callback<T> = (err: Error | null, result: T | null) => void;
 
 export interface IKlipProviderOptions {
@@ -349,10 +351,10 @@ export class KlipWeb3Provider extends SafeEventEmitter implements Web3Provider {
         return this.getChainId();
     }
 
-    private async _personal_sign(params: unknown[]): Promise<JSONRPCResponse> {
+    private async _personal_sign(params: any[]): Promise<JSONRPCResponse> {
         return new Promise<JSONRPCResponse>(async (resolve, reject) => {
             const bappName = this.bappName;
-            const value = typeof params[0] === 'string' ? params[0] : 'undefined'; //message
+            const value = params[0];
             const from = params[1];
             const res = await prepare.signMessage({
                 bappName,
@@ -391,12 +393,67 @@ export class KlipWeb3Provider extends SafeEventEmitter implements Web3Provider {
         });
     }
 
+    private async _execute_contract(params: any[]): Promise<JSONRPCResponse> {
+        return new Promise<JSONRPCResponse>(async (resolve, reject) => {
+            try {
+                const bappName = this.bappName;
+                const to = params[0]['to'];
+                const encoded_function_call = params[0]['data'];
+                const value = !!params[0]['value'] ? params[0]['value'] : '0'; // unit: Peb
+
+                const fetchRes = await axios.post(
+                    KlipAPIUrl,
+                    {
+                        bapp: { name: bappName },
+                        type: 'execute_contract',
+                        transaction: { to, encoded_function_call, value },
+                    },
+                    { headers: { 'Content-Type': `application/json` } },
+                );
+
+                if (fetchRes.status === 200) {
+                    const request_key = fetchRes.data.request_key;
+                    const klipLink = KlipUrl + request_key;
+                    this.qrcodeModal.open(klipLink, () => {
+                        this.emit('modal_closed');
+                    });
+                    const interval = setInterval(() => {
+                        getResult(request_key).then((data: any) => {
+                            if (data.status == 'completed') {
+                                this.qrcodeModal.close();
+                                clearInterval(interval);
+                                return resolve({
+                                    jsonrpc: '2.0',
+                                    id: 0,
+                                    result: data.result.tx_hash,
+                                });
+                            } else if (data.status == 'canceled' || data.status == 'error') {
+                                this.qrcodeModal.close();
+                                clearInterval(interval);
+                                return reject(new Error('Process is canceled or error occurs'));
+                            }
+                        });
+                    }, 1000);
+                    this.on('modal_closed', () => {
+                        clearInterval(interval);
+                        return reject(new Error('QRCode modal is closed!'));
+                    });
+                } else {
+                    throw new Error(fetchRes.data.err_msg);
+                }
+            } catch (error) {
+                reject(error);
+            }
+        });
+    }
+
     private async _eth_sendTransaction(params: any[]): Promise<JSONRPCResponse> {
+        if (params[0].hasOwnProperty('data') && params[0]['data'] != '') {
+            return this._execute_contract(params);
+        }
+
         // send token transaction & send klay transaction
         return new Promise<JSONRPCResponse>(async (resolve, reject) => {
-            if (params[0].hasOwnProperty('data') && params[0]['data'] != '') {
-                return reject(new Error('This provider cannot be used to execute smart contract functions.'));
-            }
             const bappName = this.bappName;
             const to = params[0]['to'];
             const amount = (Number(params[0]['value']) * Number(10 ** -18)).toFixed(6).toString();
